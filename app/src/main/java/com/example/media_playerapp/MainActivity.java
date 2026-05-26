@@ -1,12 +1,15 @@
 package com.example.media_playerapp;
-import android.annotation.SuppressLint;                        //Used to ignore warnings
+
+import android.annotation.SuppressLint;
 import android.content.Intent;
+import android.database.Cursor;
 import android.graphics.drawable.GradientDrawable;
 import android.media.MediaPlayer;
-import android.net.Uri;                                       //Represents file path
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
-import android.os.Looper;                                     //Ensures code runs on main UI thread
+import android.os.Looper;
+import android.provider.OpenableColumns;
 import android.view.View;
 import android.widget.*;
 import androidx.activity.result.ActivityResultLauncher;
@@ -32,7 +35,7 @@ public class MainActivity extends AppCompatActivity {
     private MediaPlayer mediaPlayer;
     private boolean isAudioMode = true;
     private boolean isVideoReady = false;
-    private Uri currentAudioUri = null;
+    private Uri currentMediaUri = null;
     private String currentVideoUrl = null;
 
     // Progress updater
@@ -43,55 +46,61 @@ public class MainActivity extends AppCompatActivity {
             if (isAudioMode && mediaPlayer != null && mediaPlayer.isPlaying()) {
                 int current = mediaPlayer.getCurrentPosition();
                 int total = mediaPlayer.getDuration();
-                seekBar.setMax(total);
-                seekBar.setProgress(current);
-                tvCurrentTime.setText(formatTime(current));
-                tvTotalTime.setText(formatTime(total));
+                updateProgressUI(current, total);
                 handler.postDelayed(this, 500);
             } else if (!isAudioMode && videoView != null && videoView.isPlaying()) {
                 int current = videoView.getCurrentPosition();
                 int total = videoView.getDuration();
                 if (total > 0) {
-                    seekBar.setMax(total);
-                    seekBar.setProgress(current);
-                    tvCurrentTime.setText(formatTime(current));
-                    tvTotalTime.setText(formatTime(total));
+                    updateProgressUI(current, total);
                 }
                 handler.postDelayed(this, 500);
             }
         }
     };
 
-    // File picker launcher
-    private final ActivityResultLauncher<Intent> filePickerLauncher =
-            registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
-                if (result.getResultCode() == RESULT_OK && result.getData() != null) {
-                    Uri selectedUri = result.getData().getData();
-                    if (selectedUri != null) {
-                        // Persist permissions to ensure we can play it
-                        try {
-                            getContentResolver().takePersistableUriPermission(selectedUri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                        } catch (Exception ignored) {}
+    private void updateProgressUI(int current, int total) {
+        seekBar.setMax(total);
+        seekBar.setProgress(current);
+        tvCurrentTime.setText(formatTime(current));
+        tvTotalTime.setText(formatTime(total));
+    }
 
-                        resetPlayer();
-                        currentAudioUri = selectedUri;
-                        
-                        String fileName = selectedUri.getLastPathSegment();
-                        if (fileName != null && fileName.contains("/")) {
-                            fileName = fileName.substring(fileName.lastIndexOf("/") + 1);
-                        }
-                        tvNowPlaying.setText(fileName != null ? fileName : "Selected file");
-                        
-                        if (isAudioMode) {
-                            setStatus("Audio loaded — press Play", "#03DAC6");
-                            setDotColor("#03DAC6");
-                        } else {
-                            videoView.setVideoURI(selectedUri);
+    // Modern File picker launcher using OpenDocument contract
+    private final ActivityResultLauncher<String[]> filePickerLauncher =
+            registerForActivityResult(new ActivityResultContracts.OpenDocument(), uri -> {
+                if (uri != null) {
+                    try {
+                        // Persist permissions so we can play the file later
+                        getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    } catch (Exception ignored) {}
+
+                    resetPlayer();
+                    currentMediaUri = uri;
+                    
+                    String fileName = getFileName(uri);
+                    tvNowPlaying.setText(fileName);
+                    
+                    if (isAudioMode) {
+                        setStatus("Audio file loaded — press Play", "#03DAC6");
+                        setDotColor("#03DAC6");
+                    } else {
+                        videoView.setVideoURI(uri);
+                        videoView.setOnPreparedListener(mp -> {
                             isVideoReady = true;
-                            setStatus("Video loaded — press Play", "#03DAC6");
+                            tvTotalTime.setText(formatTime(videoView.getDuration()));
+                            setStatus("Video file loaded — press Play", "#03DAC6");
                             setDotColor("#03DAC6");
-                        }
+                        });
+                        videoView.setOnErrorListener((mp, what, extra) -> {
+                            setStatus("⚠ Error loading video file", "#CF6679");
+                            setDotColor("#CF6679");
+                            isVideoReady = false;
+                            return true;
+                        });
                     }
+                } else {
+                    setStatus("File selection cancelled", "#888888");
                 }
             });
 
@@ -105,6 +114,8 @@ public class MainActivity extends AppCompatActivity {
         setupModeToggle();
         setupButtons();
         setupSeekBar();
+        
+        setStatus("Ready — select a file or URL", "#888888");
     }
 
     private void bindViews() {
@@ -132,78 +143,56 @@ public class MainActivity extends AppCompatActivity {
         radioGroupMode.setOnCheckedChangeListener((group, checkedId) -> {
             isAudioMode = (checkedId == R.id.radioAudio);
             resetPlayer();
-            btnOpenFile.setVisibility(View.VISIBLE);
+            resetProgress();
+            
             if (isAudioMode) {
                 cardAudio.setVisibility(View.VISIBLE);
                 cardVideo.setVisibility(View.GONE);
                 layoutUrl.setVisibility(View.GONE);
-                btnOpenFile.setText("📁  Open Audio File from Disk");
-                tvNowPlaying.setText("No file selected");
-                setStatus("Audio mode — open a file to begin", "#888888");
+                btnOpenFile.setText("📁  Open Audio File");
+                tvNowPlaying.setText("No audio selected");
+                setStatus("Switched to Audio Mode", "#888888");
             } else {
                 cardAudio.setVisibility(View.GONE);
                 cardVideo.setVisibility(View.VISIBLE);
                 layoutUrl.setVisibility(View.VISIBLE);
-                btnOpenFile.setText("📁  Open Video File from Disk");
-                setStatus("Video mode — Load URL or Open File", "#888888");
+                btnOpenFile.setText("📁  Open Video File");
+                tvNowPlaying.setText("No video selected");
+                setStatus("Switched to Video Mode", "#888888");
             }
-            resetProgress();
         });
     }
 
     private void setupButtons() {
         btnOpenFile.setOnClickListener(v -> {
-            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-            intent.addCategory(Intent.CATEGORY_OPENABLE);
-            intent.setType("*/*");
-            String[] mimeTypes = {"audio/*", "video/*"};
-            intent.putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes);
-            filePickerLauncher.launch(intent);
+            // Launching the picker with both audio and video types to ensure files are not greyed out
+            filePickerLauncher.launch(new String[]{"audio/*", "video/*"});
         });
 
         btnOpenUrl.setOnClickListener(v -> {
             String url = etUrl.getText().toString().trim();
             if (url.isEmpty()) {
-                setStatus("⚠ Please enter a video URL", "#CF6679");
-                return;
-            }
-            if (!url.startsWith("http://") && !url.startsWith("https://")) {
-                setStatus("⚠ URL must start with http:// or https://", "#CF6679");
+                setStatus("⚠ Please enter a URL", "#CF6679");
                 return;
             }
             resetPlayer();
             currentVideoUrl = url;
             isVideoReady = false;
-            setStatus("Loading video...", "#FF9800");
+            setStatus("Loading URL...", "#FF9800");
             setDotColor("#FF9800");
 
-            Uri videoUri = Uri.parse(currentVideoUrl);
-            videoView.setVideoURI(videoUri);
-
+            videoView.setVideoURI(Uri.parse(currentVideoUrl));
             videoView.setOnPreparedListener(mp -> {
                 isVideoReady = true;
                 tvTotalTime.setText(formatTime(videoView.getDuration()));
-                setStatus("Video ready — press Play", "#03DAC6");
+                setStatus("URL loaded — press Play", "#03DAC6");
                 setDotColor("#03DAC6");
             });
-
-            videoView.setOnCompletionListener(mp -> {
-                setStatus("Playback complete", "#BB86FC");
-                setDotColor("#BB86FC");
-                resetProgress();
-                handler.removeCallbacks(progressUpdater);
-            });
-
             videoView.setOnErrorListener((mp, what, extra) -> {
-                setStatus("⚠ Error loading video", "#CF6679");
+                setStatus("⚠ Error loading URL", "#CF6679");
                 setDotColor("#CF6679");
-                isVideoReady = false;
                 return true;
             });
-
-            MediaController mediaController = new MediaController(this);
-            mediaController.setAnchorView(videoView);
-            videoView.setMediaController(mediaController);
         });
 
         btnPlay.setOnClickListener(v -> handlePlay());
@@ -219,11 +208,10 @@ public class MainActivity extends AppCompatActivity {
                 if (fromUser) {
                     if (isAudioMode && mediaPlayer != null) {
                         mediaPlayer.seekTo(progress);
-                        tvCurrentTime.setText(formatTime(progress));
                     } else if (!isAudioMode && (isVideoReady || videoView.isPlaying())) {
                         videoView.seekTo(progress);
-                        tvCurrentTime.setText(formatTime(progress));
                     }
+                    tvCurrentTime.setText(formatTime(progress));
                 }
             }
             @Override public void onStartTrackingTouch(SeekBar seekBar) {}
@@ -233,103 +221,73 @@ public class MainActivity extends AppCompatActivity {
 
     private void handlePlay() {
         if (isAudioMode) {
-            if (currentAudioUri == null) {
-                setStatus("⚠ No audio file selected", "#CF6679");
+            if (currentMediaUri == null) {
+                setStatus("⚠ Select an audio file first", "#CF6679");
                 return;
             }
             if (mediaPlayer == null) {
                 try {
                     mediaPlayer = new MediaPlayer();
-                    mediaPlayer.setDataSource(this, currentAudioUri);
+                    mediaPlayer.setDataSource(this, currentMediaUri);
                     mediaPlayer.prepare();
                     mediaPlayer.setOnCompletionListener(mp -> {
-                        setStatus("Playback complete", "#BB86FC");
+                        setStatus("Playback finished", "#BB86FC");
                         setDotColor("#BB86FC");
-                        resetProgress();
                         handler.removeCallbacks(progressUpdater);
                     });
                 } catch (Exception e) {
-                    setStatus("⚠ Error: " + e.getMessage(), "#CF6679");
+                    setStatus("⚠ Playback Error", "#CF6679");
                     return;
                 }
             }
-            if (!mediaPlayer.isPlaying()) {
-                mediaPlayer.start();
-                setStatus("▶ Playing", "#4CAF50");
-                setDotColor("#4CAF50");
-                handler.post(progressUpdater);
-            }
+            mediaPlayer.start();
+            setStatus("▶ Playing Audio", "#4CAF50");
         } else {
+            if (!isVideoReady && !videoView.isPlaying() && currentMediaUri != null) {
+                videoView.setVideoURI(currentMediaUri);
+            }
             if (!isVideoReady && !videoView.isPlaying()) {
-                setStatus("⚠ Load a video first", "#CF6679");
+                setStatus("⚠ Load video first", "#CF6679");
                 return;
             }
             videoView.start();
-            setStatus("▶ Playing", "#4CAF50");
-            setDotColor("#4CAF50");
-            handler.post(progressUpdater);
+            setStatus("▶ Playing Video", "#4CAF50");
         }
+        setDotColor("#4CAF50");
+        handler.post(progressUpdater);
     }
 
     private void handlePause() {
-        if (isAudioMode) {
-            if (mediaPlayer != null && mediaPlayer.isPlaying()) {
-                mediaPlayer.pause();
-                setStatus("⏸ Paused", "#FF9800");
-                setDotColor("#FF9800");
-                handler.removeCallbacks(progressUpdater);
-            }
-        } else {
-            if (videoView.isPlaying()) {
-                videoView.pause();
-                setStatus("⏸ Paused", "#FF9800");
-                setDotColor("#FF9800");
-                handler.removeCallbacks(progressUpdater);
-            }
+        if (isAudioMode && mediaPlayer != null && mediaPlayer.isPlaying()) {
+            mediaPlayer.pause();
+        } else if (!isAudioMode && videoView.isPlaying()) {
+            videoView.pause();
         }
+        setStatus("⏸ Paused", "#FF9800");
+        setDotColor("#FF9800");
+        handler.removeCallbacks(progressUpdater);
     }
 
     private void handleStop() {
         resetPlayer();
+        resetProgress();
         setStatus("⏹ Stopped", "#888888");
         setDotColor("#555555");
-        resetProgress();
     }
 
     private void handleRestart() {
-        if (isAudioMode) {
-            if (currentAudioUri == null) {
-                setStatus("⚠ No audio file selected", "#CF6679");
-                return;
-            }
-            if (mediaPlayer != null) {
-                mediaPlayer.release();
-                mediaPlayer = null;
-            }
-            handlePlay();
-        } else {
-            if (!isVideoReady && currentVideoUrl == null && currentAudioUri == null) {
-                setStatus("⚠ No video loaded", "#CF6679");
-                return;
-            }
-            videoView.seekTo(0);
-            videoView.start();
-            setStatus("↺ Restarted", "#4CAF50");
-            setDotColor("#4CAF50");
-            handler.post(progressUpdater);
-        }
+        handleStop();
+        handlePlay();
     }
 
     private void resetPlayer() {
         handler.removeCallbacks(progressUpdater);
         if (mediaPlayer != null) {
-            try { if (mediaPlayer.isPlaying()) mediaPlayer.stop(); } catch (Exception ignored) {}
             mediaPlayer.release();
             mediaPlayer = null;
         }
         videoView.stopPlayback();
-        // Keep isVideoReady true if we are just stopping, 
-        // but handle it in playback logic
+        isVideoReady = false;
     }
 
     private void resetProgress() {
@@ -356,13 +314,32 @@ public class MainActivity extends AppCompatActivity {
         return String.format(Locale.getDefault(), "%d:%02d", minutes, seconds);
     }
 
+    @SuppressLint("Range")
+    private String getFileName(Uri uri) {
+        String result = null;
+        if (uri.getScheme().equals("content")) {
+            try (Cursor cursor = getContentResolver().query(uri, null, null, null, null)) {
+                if (cursor != null && cursor.moveToFirst()) {
+                    int nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                    if (nameIndex != -1) {
+                        result = cursor.getString(nameIndex);
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+        if (result == null) {
+            result = uri.getPath();
+            if (result != null) {
+                int cut = result.lastIndexOf('/');
+                if (cut != -1) result = result.substring(cut + 1);
+            }
+        }
+        return result != null ? result : "Unknown File";
+    }
+
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        handler.removeCallbacks(progressUpdater);
-        if (mediaPlayer != null) {
-            mediaPlayer.release();
-            mediaPlayer = null;
-        }
+        resetPlayer();
     }
 }
